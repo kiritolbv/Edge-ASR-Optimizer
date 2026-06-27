@@ -1,0 +1,297 @@
+import re
+import time
+import requests
+import subprocess
+import whisper
+import imageio_ffmpeg
+import numpy as np
+import wave
+import shutil
+import tempfile
+from pathlib import Path
+from urllib.parse import quote
+from playwright.sync_api import sync_playwright
+
+
+def clean_filename(text):
+    text = re.sub(r'[\\/*?:"<>|]', "", text)
+    return text[:80].strip().replace(" ", "_")
+
+
+def clean_folder_name(text):
+    text = re.sub(r'[\\/*?:"<>|]', "", text)
+    return text[:50].strip().replace(" ", "_")
+
+
+def seconds_to_srt_time(seconds):
+    ms = int((seconds - int(seconds)) * 1000)
+    seconds = int(seconds)
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{h:02}:{m:02}:{s:02},{ms:03}"
+
+
+def download_file(url, path):
+    r = requests.get(url, stream=True, timeout=30)
+    r.raise_for_status()
+
+    with open(path, "wb") as f:
+        for chunk in r.iter_content(8192):
+            if chunk:
+                f.write(chunk)
+
+
+def get_stealth_script():
+    return """
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        Object.defineProperty(navigator, 'plugins', { get: () => [{ name: 'Chrome PDF Plugin' }] });
+        window.chrome = { runtime: {} };
+        Object.defineProperty(navigator, 'languages', { get: () => ['fr-FR', 'fr', 'en-US'] });
+        Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+    """
+
+
+def get_clip_info(page, phrase):
+    info = {
+        "video_url": None,
+        "movie": "Inconnu",
+        "subtitle": phrase
+    }
+
+    try:
+        page.wait_for_selector("video", timeout=10000)
+    except:
+        return info
+
+    video = page.locator("video").first
+    src = video.get_attribute("src")
+
+    if src and src.startswith("http"):
+        info["video_url"] = src
+
+    title_selectors = [".movie-title", ".film-title", ".source-title", "h2"]
+
+    for selector in title_selectors:
+        elements = page.locator(selector)
+        if elements.count() > 0:
+            txt = elements.first.inner_text().strip()
+            if txt:
+                info["movie"] = txt
+                break
+
+    return info
+
+
+def get_all_clips(phrase, number=3, start_pos=0):
+    clips = []
+
+    print("Récupération des clips...")
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"]
+        )
+
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/120.0.0.0 Safari/537.36"
+        )
+
+        page = context.new_page()
+        page.add_init_script(get_stealth_script())
+
+        for pos in range(start_pos, start_pos + number):
+            url = f"https://www.playphrase.me/#/search?q={quote(phrase)}&pos={pos}&language=en"
+
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                time.sleep(2)
+
+                info = get_clip_info(page, phrase)
+
+                if info["video_url"]:
+                    clips.append(info)
+                    print(f"  OK - Clip {pos} - {info['movie']}")
+                else:
+                    print(f"  ECHEC - Clip {pos} introuvable")
+
+            except Exception as e:
+                print(f"  ECHEC - Clip {pos} introuvable : {str(e)[:80]}")
+
+        browser.close()
+
+    return clips
+
+
+def extract_subtitles_from_video(video_path, srt_path):
+    print("    Extraction du texte avec Whisper...")
+
+    ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+    video_path = Path(video_path)
+    audio_path = video_path.with_suffix(".wav")
+
+    command = [
+        ffmpeg_path,
+        "-y",
+        "-i", str(video_path),
+        "-ar", "16000",
+        "-ac", "1",
+        "-c:a", "pcm_s16le",
+        str(audio_path)
+    ]
+
+    try:
+        subprocess.run(command, check=True)
+
+        # Whisper appelle normalement "ffmpeg" depuis le PATH pour lire un
+        # fichier. Sous Windows, le binaire imageio-ffmpeg n'est pas nommé
+        # ffmpeg.exe. On lit donc le WAV PCM déjà produit et on fournit les
+        # échantillons directement à Whisper.
+        with wave.open(str(audio_path), "rb") as wav_file:
+            if (wav_file.getnchannels(), wav_file.getsampwidth(), wav_file.getframerate()) != (1, 2, 16000):
+                raise RuntimeError("Le fichier audio temporaire n'est pas un WAV mono 16 kHz valide.")
+            audio = np.frombuffer(wav_file.readframes(wav_file.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
+
+        model = whisper.load_model("base")
+        result = model.transcribe(audio, language="en", fp16=False)
+        segments = [segment for segment in result["segments"] if segment["text"].strip()]
+        if not segments:
+            raise RuntimeError("Whisper n'a détecté aucun texte dans cette vidéo.")
+
+        with open(srt_path, "w", encoding="utf-8") as f:
+            for i, segment in enumerate(segments, start=1):
+                start = seconds_to_srt_time(segment["start"])
+                end = seconds_to_srt_time(segment["end"])
+                f.write(f"{i}\n{start} --> {end}\n{segment['text'].strip()}\n\n")
+        return result["text"].strip()
+    finally:
+        audio_path.unlink(missing_ok=True)
+
+
+def burn_yellow_subtitles(video_path, srt_path, output_path):
+    print("    Création de la vidéo avec sous-titres jaunes...")
+
+    ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+
+    subtitle_style = (
+        "FontName=Arial,FontSize=28,PrimaryColour=&H0000FFFF&,"
+        "OutlineColour=&H00000000&,BorderStyle=1,Outline=2,"
+        "Shadow=1,Alignment=2,MarginV=35"
+    )
+    # Dans un filtre FFmpeg, les virgules séparent les filtres. Elles doivent
+    # rester échappées, même à l'intérieur de force_style.
+    subtitle_style = subtitle_style.replace(",", r"\,")
+    # Le parseur de filtres FFmpeg gère mal une apostrophe dans un chemin.
+    # Copier le SRT dans un répertoire temporaire sûr évite ce problème.
+    with tempfile.TemporaryDirectory(prefix="playphrase_subtitles_") as temp_dir:
+        temporary_srt = Path(temp_dir) / "subtitles.srt"
+        shutil.copyfile(srt_path, temporary_srt)
+        srt_filter_path = str(temporary_srt).replace("\\", "/").replace(":", r"\:")
+        subtitle_filter = (
+            f"subtitles=filename='{srt_filter_path}':charenc=UTF-8:"
+            f"force_style='{subtitle_style}'"
+        )
+        command = [
+            ffmpeg_path,
+            "-y",
+            "-i", str(video_path),
+            "-vf", subtitle_filter,
+            "-c:v", "libx264",
+            "-crf", "18",
+            "-preset", "medium",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-movflags", "+faststart",
+            str(output_path)
+        ]
+        subprocess.run(command, check=True)
+
+
+def main():
+    print("PlayPhrase Downloader + Sous-titres")
+    print("-" * 40)
+
+    phrase = input("Phrase : ").strip()
+    if not phrase:
+        print("Phrase vide.")
+        return
+
+    number = int(input("Nombre [3] : ").strip() or "3")
+    start_pos = int(input("Position départ [0] : ").strip() or "0")
+
+    folder_name = clean_folder_name(phrase)
+    output_dir = Path("extraits") / folder_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    clips = get_all_clips(phrase, number, start_pos)
+
+    if not clips:
+        print("ERREUR : aucun clip trouvé.")
+        return
+
+    print(f"\nTéléchargement de {len(clips)} clips...")
+
+    info_path = output_dir / "info.txt"
+
+    with open(info_path, "w", encoding="utf-8") as info_file:
+        info_file.write(f"Phrase recherchée : {phrase}\n")
+        info_file.write("=" * 40 + "\n\n")
+
+        for i, clip in enumerate(clips, start=1):
+            movie_name = clean_filename(clip["movie"])
+
+            if movie_name and movie_name != "Inconnu":
+                filename = f"{i}_{movie_name}_{clean_filename(phrase)}.mp4"
+            else:
+                filename = f"{i}_{clean_filename(phrase)}.mp4"
+
+            if len(filename) > 100:
+                filename = f"{i}_{clean_filename(phrase)}.mp4"
+
+            original_video_path = output_dir / filename
+            srt_path = output_dir / filename.replace(".mp4", ".srt")
+            subtitled_video_path = output_dir / filename.replace(".mp4", "_subtitled.mp4")
+
+            try:
+                print(f"\n  {i}/{len(clips)} : Téléchargement...")
+                download_file(clip["video_url"], original_video_path)
+                print(f"    OK - Vidéo téléchargée : {original_video_path.name}")
+
+                extracted_text = extract_subtitles_from_video(original_video_path, srt_path)
+                print(f"    OK - Sous-titres extraits : {srt_path.name}")
+
+                burn_yellow_subtitles(original_video_path, srt_path, subtitled_video_path)
+                print(f"    OK - Vidéo finale : {subtitled_video_path.name}")
+
+                info_file.write(f"Clip {i} : {clip['movie']}\n")
+                info_file.write(f"Vidéo originale : {original_video_path.name}\n")
+                info_file.write(f"Vidéo avec sous-titres : {subtitled_video_path.name}\n")
+                info_file.write(f"Texte extrait : {extracted_text}\n")
+                info_file.write("-" * 40 + "\n\n")
+
+            except Exception as e:
+                print(f"    ERREUR : {e}")
+
+    print(f"\nTerminé. Dossier : {output_dir}")
+
+
+if __name__ == "__main__":
+    main()
+
+# Fonctions exportées pour cinereplique_app.py
+def ensure_playwright_browser():
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as p:
+        executable = p.chromium.executable_path
+    return executable
+
+def process_clip(clip, index, run_dir, optimizer, model, language):
+    from pathlib import Path
+    movie = clean_filename(clip.get('movie', 'inconnu'))
+    filename = f"{index:02d}_{movie}.mp4"
+    video_path = run_dir / filename
+    download_file(clip['video_url'], video_path)
+    return {'video': video_path, 'movie': clip.get('movie', 'inconnu')}

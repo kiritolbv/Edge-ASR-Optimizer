@@ -1,0 +1,257 @@
+﻿"""Interface Streamlit du jeu CinÃ©RÃ©plique."""
+
+from __future__ import annotations
+
+import random
+import time
+from datetime import datetime
+from pathlib import Path
+
+import streamlit as st
+import whisper
+
+from audio_to_clips_pipeline import (
+    ROOT,
+    AudioMLOptimizer,
+    PipelineConfig,
+    ensure_playwright_browser,
+    get_all_clips,
+    process_clip,
+    transcribe_wav,
+)
+
+
+st.set_page_config(page_title="CinÃ©Reply", page_icon="ðŸŽ¬", layout="wide", initial_sidebar_state="collapsed")
+
+
+def inject_style() -> None:
+    st.markdown(
+        """<style>
+        [data-testid="stHeader"], [data-testid="stSidebar"] {display:none;}
+        .stApp {background:radial-gradient(circle at 50% 30%, #24100f 0%, #090b0d 45%, #050607 100%); color:#f5f3f2;}
+        .block-container {max-width:1120px; padding:1.35rem clamp(1rem,4vw,3.5rem) 2.5rem;}
+        .topbar {display:grid; grid-template-columns:44px 1fr 44px; align-items:center; min-height:44px; color:#ecedeb; margin-bottom:2.3rem;}
+        .topbar .brand {text-align:center; font-weight:800; letter-spacing:.04em; font-size:1.05rem;}
+        .topbar .icon {font-size:1.25rem; color:#b8b8b5; text-align:center;}
+        .screen-title {text-align:center; font-size:.82rem; letter-spacing:.06em; font-weight:800; text-transform:uppercase; margin:-1.15rem 0 2rem; color:#f3f2f1;}
+        .brand span {color:#ef443c; border-bottom:2px solid #ef443c;}
+        .eyebrow {color:#f04c44; font-size:.78rem; letter-spacing:.08em; font-weight:800; text-transform:uppercase;}
+        .hero {text-align:center; font-size:clamp(2rem,4vw,3.35rem); line-height:1.08; letter-spacing:.01em; font-weight:750; margin:.5rem 0 1rem;}
+        .hero em {color:#f0473f; font-style:normal;}
+        .subtitle {text-align:center; color:#bbb7b5; font-size:1rem; line-height:1.5; margin-bottom:1.8rem;}
+        .panel {background:rgba(12,15,17,.9); border:1px solid #282d30; border-radius:22px; padding:1.35rem; margin:.8rem 0; box-shadow:0 10px 40px rgba(0,0,0,.3);}
+        .wave {color:#f04c44; text-align:center; font-size:1.6rem; letter-spacing:.18em; margin:1.5rem 0 .5rem; opacity:.85;}
+        .mic-copy {text-align:center; margin-top:1rem; color:#e5e2e0; font-size:1.05rem;}
+        .orbital {border:1px solid rgba(239,68,60,.35); border-radius:50%; width:250px; height:250px; margin:1.2rem auto -13.7rem; box-shadow:0 0 0 18px rgba(239,68,60,.025), 0 0 0 42px rgba(239,68,60,.018); pointer-events:none;}
+        .search-orb {width:166px; height:166px; border:3px solid #ef443c; border-radius:50%; margin:2rem auto; display:flex; align-items:center; justify-content:center; color:#fff; font-size:4rem; box-shadow:0 0 0 14px rgba(239,68,60,.08),0 0 40px rgba(239,68,60,.35);}
+        .result-video {border:1px solid #f04c44; border-radius:18px; overflow:hidden; padding:3px; background:#090b0d;}
+        .quiz-progress {height:5px; background:#31363a; border-radius:999px; margin:1.2rem auto 2rem; max-width:420px; position:relative;}
+        .quiz-progress:before {content:''; position:absolute; width:33%; height:100%; border-radius:999px; background:#ef443c; left:0; top:0;}
+        .quote {border:1px solid #2d3235; border-radius:17px; padding:1.2rem; text-align:center; font-size:1.15rem; line-height:1.45; margin:1rem 0; background:#0c1012;}
+        .quote:before {content:'â€œ'; color:#71787d; font-size:3rem; float:left; height:1.3rem;}
+        .step {display:flex; gap:.7rem; align-items:start; margin:.9rem 0; color:#d7d2d0;}
+        .step b {color:#f04c44;}
+        .stButton {display:flex; justify-content:center; margin:1.8rem auto .8rem;}
+        .stButton>button {width:min(100%,430px); min-height:62px; border:0; border-radius:999px; background:linear-gradient(90deg,#e73d37,#f05243); color:#fff; font-weight:850; letter-spacing:.04em; padding:1rem 1.5rem; font-size:1.04rem; box-shadow:0 10px 26px rgba(227,57,50,.25); transition:transform .16s ease, box-shadow .16s ease;}
+        .stButton>button:hover {border:0; color:#fff; background:linear-gradient(90deg,#ff5148,#e73d37); transform:translateY(-2px); box-shadow:0 14px 30px rgba(239,68,60,.35);}
+        [data-testid="stAudioInput"] {border:2px solid #ee4840; border-radius:50%; width:190px; height:190px; margin:1rem auto 1.5rem; display:flex; align-items:center; justify-content:center; box-shadow:0 0 0 12px rgba(239,68,60,.08),0 0 35px rgba(239,68,60,.45); background:radial-gradient(circle,rgba(235,65,55,.15),rgba(7,9,10,.6));}
+        [data-testid="stAudioInput"] button {color:#fff;}
+        .stRadio > div {gap:.45rem;}
+        .stRadio label {background:#101416; border:1px solid #303539; border-radius:14px; padding:.55rem .75rem; width:100%;}
+        .stRadio label:has(input:checked) {border-color:#f04c44; box-shadow:inset 0 0 0 1px #f04c44;}
+        .score {text-align:right; color:#f04c44; font-size:1.7rem; font-weight:800; margin-top:-2.6rem;}
+        .desktop-side {padding:1.25rem 1rem;}
+        @media (max-width: 720px) {
+          .block-container {padding:1rem .9rem 2rem;}
+          .topbar {margin-bottom:1.9rem;}
+          .panel {padding:1rem; border-radius:18px;}
+          .stButton {margin:1.35rem auto .7rem;}
+          .stButton>button {width:100%; min-height:58px; font-size:1rem;}
+          [data-testid="stAudioInput"] {width:165px; height:165px;}
+          [data-testid="stHorizontalBlock"] {flex-direction:column;}
+          [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {width:100% !important; flex:1 1 100% !important;}
+          .desktop-side {padding:0;}
+        }
+        </style>""",
+        unsafe_allow_html=True,
+    )
+
+
+def initialise_state() -> None:
+    defaults = {"screen": "record", "result": None, "quiz": None, "score": None, "recording": None}
+    for key, value in defaults.items():
+        st.session_state.setdefault(key, value)
+
+
+@st.cache_resource(show_spinner=False)
+def whisper_model() -> whisper.Whisper:
+    return whisper.load_model("base")
+
+
+def make_quiz(movie: str) -> list[dict[str, object]]:
+    title = movie if movie and movie != "Inconnu" else "Le Parrain"
+    questions = [
+        ("What is the movie title?", title, ["Goodfellas", "Once Upon a Time in America"]),
+        ("What year was it released?", "1972", ["1970", "1974"]),
+        ("Which actor says this line?", "Marlon Brando", ["Al Pacino", "Robert De Niro"]),
+    ]
+    quiz = []
+    for label, answer, alternatives in questions:
+        choices = [answer, *alternatives]
+        random.shuffle(choices)
+        quiz.append({"label": label, "answer": answer, "choices": choices})
+    return quiz
+
+
+def save_recording(recording: st.runtime.uploaded_file_manager.UploadedFile) -> Path:
+    recordings = ROOT / "enregistrement_voix"
+    recordings.mkdir(exist_ok=True)
+    target = recordings / f"joueur_{datetime.now():%Y%m%d_%H%M%S}.wav"
+    target.write_bytes(recording.getvalue())
+    return target
+
+
+def execute_pipeline(recording: st.runtime.uploaded_file_manager.UploadedFile, status: st.status) -> dict[str, object]:
+    source = save_recording(recording)
+    run_dir = ROOT / "interface_output" / source.stem
+    run_dir.mkdir(parents=True, exist_ok=True)
+    optimizer = AudioMLOptimizer(PipelineConfig())
+
+    status.update(label="Preparing your audioâ€¦", state="running")
+    prepared_audio = run_dir / "input_asr.wav"
+    optimizer.process_file(source, prepared_audio)
+
+    status.update(label="Whisper is analysing your lineâ€¦", state="running")
+    text = transcribe_wav(whisper_model(), prepared_audio, "en", run_dir / "input.srt")
+    (run_dir / "transcription.txt").write_text(text + "\n", encoding="utf-8")
+    if not text:
+        raise RuntimeError("No spoken line was detected.")
+
+    status.update(label="Searching for three clipsâ€¦", state="running")
+    ensure_playwright_browser()
+    clips = get_all_clips(text, number=3, start_pos=0)
+    if not clips:
+        raise RuntimeError("No clip was found for this line.")
+
+    status.update(label="Preparing clips and subtitlesâ€¦", state="running")
+    completed: list[dict[str, object]] = []
+    for index, clip in enumerate(clips, start=1):
+        process_clip(clip, index, run_dir, optimizer, whisper_model(), "en")
+        video = run_dir / f"{index:02d}_{clean_name(clip['movie'])}_subtitled.mp4"
+        if video.exists():
+            completed.append({"clip": clip, "video": video})
+    if not completed:
+        raise RuntimeError("Clips were found, but no final MP4 could be created.")
+    status.update(label="Line found!", state="complete")
+    return {"text": text, "clips": completed, "directory": run_dir}
+
+
+def clean_name(value: str) -> str:
+    from playphrase_original import clean_filename
+
+    return clean_filename(value) or "inconnu"
+
+
+def header(title: str) -> None:
+    st.markdown(
+        f"<div class='topbar'><div class='icon'>â˜°</div><div class='brand'><span style='color:#ef443c;border-bottom:2px solid #ef443c'>CINÃ‰</span>REPLY</div><div class='icon'>â™¡</div></div><div class='screen-title'>{title}</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def record_screen() -> None:
+    header("Say a movie line")
+    left, right = st.columns((1.15, .85), gap="large")
+    with left:
+        st.markdown("<div class='hero'>SAY A LINE,<br><em>WE FIND THE MOVIE.</em></div>", unsafe_allow_html=True)
+        st.markdown("<div class='subtitle'>Tap the microphone and speak naturally.</div>", unsafe_allow_html=True)
+        st.markdown("<div class='orbital'></div>", unsafe_allow_html=True)
+        recording = st.audio_input("Tap to speak", label_visibility="collapsed")
+        st.markdown("<div class='wave'>ã€°ã€°ã€°ã€°ã€°</div><div class='mic-copy'>Tap to speak</div><div class='subtitle'>Record your favourite movie line</div>", unsafe_allow_html=True)
+    with right:
+        st.markdown("""<div class='panel desktop-side'><div class='eyebrow'>How it works</div>
+          <div class='step'><b>1.</b><div>Speak<br><small>Say a movie line.</small></div></div>
+          <div class='step'><b>2.</b><div>We search<br><small>We find the matching clip.</small></div></div>
+          <div class='step'><b>3.</b><div>Play<br><small>Guess the movie and score.</small></div></div></div>""", unsafe_allow_html=True)
+    if recording and st.button("ANALYSE MY LINE"):
+        st.session_state.recording = recording
+        st.session_state.screen = "processing"
+        st.rerun()
+
+
+def processing_screen() -> None:
+    header("Searching")
+    st.markdown("<div class='hero'>FINDING<br><em>THE PERFECT LINEâ€¦</em></div><div class='subtitle'>Your recording is being analysed. This may take a moment.</div><div class='search-orb'>âŒ•</div><div class='wave'>ã€°ã€°ã€°ã€°ã€°</div>", unsafe_allow_html=True)
+    time.sleep(0.7)
+    try:
+        with st.status("Initialisationâ€¦", expanded=True) as status:
+            st.session_state.result = execute_pipeline(st.session_state.recording, status)
+        st.session_state.screen = "result"
+        st.rerun()
+    except Exception as error:
+        st.error(str(error))
+        if st.button("START AGAIN"):
+            st.session_state.screen = "record"
+            st.rerun()
+
+
+def result_screen() -> None:
+    header("Line found")
+    result = st.session_state.result
+    first = result["clips"][0]
+    left, right = st.columns((1.25, .75), gap="large")
+    with left:
+        st.markdown("<div class='hero' style='font-size:1.7rem'>Here is the clip<br>matching your line:</div>", unsafe_allow_html=True)
+        st.markdown("<div class='result-video'>", unsafe_allow_html=True)
+        st.video(first["video"].read_bytes(), format="video/mp4")
+        st.markdown("</div>", unsafe_allow_html=True)
+    with right:
+        st.markdown(f"<div class='panel desktop-side'><div class='eyebrow' style='text-align:center'>Your line</div><div class='quote'>{result['text']}</div></div>", unsafe_allow_html=True)
+    if st.button("CONTINUE TO THE QUIZ"):
+        st.session_state.quiz = make_quiz(first["clip"]["movie"])
+        st.session_state.screen = "quiz"
+        st.rerun()
+
+
+def quiz_screen() -> None:
+    header("The challenge")
+    current_score = st.session_state.score or 0
+    st.markdown(f"<div class='score'>{current_score}/3<br><small style='color:#a4a4a4;font-size:.65rem'>SCORE</small></div><div class='hero' style='font-size:1.7rem'>YOUR TURN</div><div class='quiz-progress'></div>", unsafe_allow_html=True)
+    answers: list[str] = []
+    for index, question in enumerate(st.session_state.quiz, start=1):
+        st.markdown(f"<div class='panel'><b>{index}. {question['label']}</b></div>", unsafe_allow_html=True)
+        answers.append(st.radio("Answer", question["choices"], key=f"quiz_{index}", label_visibility="collapsed"))
+    if st.button("CHECK MY ANSWERS"):
+        st.session_state.score = sum(answer == question["answer"] for answer, question in zip(answers, st.session_state.quiz))
+        st.rerun()
+    if st.session_state.score is not None:
+        st.success(f"Score: {st.session_state.score}/3")
+        if st.button("NEW LINE"):
+            st.session_state.screen = "record"
+            st.session_state.result = None
+            st.session_state.quiz = None
+            st.session_state.score = None
+            st.session_state.recording = None
+            st.rerun()
+
+
+def main() -> None:
+    inject_style()
+    initialise_state()
+    screen = st.session_state.screen
+    if screen == "record":
+        record_screen()
+    elif screen == "processing":
+        processing_screen()
+    elif screen == "result":
+        result_screen()
+    else:
+        quiz_screen()
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
